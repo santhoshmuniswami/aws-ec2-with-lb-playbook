@@ -1,0 +1,129 @@
+
+---
+
+- hosts: localhost
+  tasks:
+    - name: Get my current IP address
+      uri:
+        url: http://checkip.amazonaws.com/
+        return_content: yes
+      register: my_ip
+
+    - name: Create simple security group
+      ec2_group:
+        name: appserver
+        description: Security group to open port ssh and http
+        region: us-east-2
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: "0.0.0.0/0"
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: "0.0.0.0/0"
+        rules_egress:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+      register: appservers_group
+
+    - name: Create the ELB only listening over port 80
+      ec2_elb_lb:
+        name: "my-load-balancer"
+        state: present
+        region: us-east-2
+        zones:
+          - us-east-2a
+          - us-east-2b
+        listeners:
+          - protocol: http
+            load_balancer_port: 80
+            instance_port: 80
+      register: elb
+
+    - name: Create an EC2 key
+      ec2_key:
+       name: "appserverkey"
+       region: us-east-2
+      register: ec2_key
+
+    - name: Save private key
+      copy: content="{{ ec2_key.key.private_key }}" dest="~/aws-private.pem" mode=0600
+      when: ec2_key.changed
+
+    - name: create app server
+      ec2:
+        key_name: appserverkey
+        instance_type: t2.micro
+        image: ami-0bdcc6c05dec346bf
+        region: us-east-2
+        group_id:
+          - "{{ appservers_group.group_id }}"
+          - "{{ elb.elb.security_group_ids | first }}"
+        wait: yes
+        exact_count: 2
+        instance_tags:
+         Name: "appserver"
+        count_tag:
+         Name: "appserver"
+      register: ec2_instances
+
+    - name: Store EC2 instance IPs to provision against
+      add_host:
+        hostname: "{{ item.public_ip }}"
+        groupname: ec2_instance_ips
+      with_items: "{{ ec2_instances.tagged_instances }}"
+
+    - name: Wait for servers to come online
+      wait_for:
+        host: "{{ item.public_ip }}"
+        port: 22
+        timeout: 180
+      with_items: "{{ ec2_instances.tagged_instances }}"
+
+    - name: Add EC2 instances as known hosts
+      known_hosts:
+        name: "{{ item.public_ip }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -t rsa ' + item.public_ip) }}"
+      with_items: "{{ ec2_instances.tagged_instances }}"
+
+
+- hosts: ec2_instance_ips
+  remote_user: ec2-user
+  become: True
+  tasks:
+    - name: Install HTTPD 
+      yum:
+        name: httpd
+        state: present
+    - name: Start httpd service
+      service:
+        name: httpd
+        state: restarted
+    - name: Create default index page
+      copy:
+        dest: /var/www/html/index.html
+        content: "Welcome to app server {{ ansible_hostname }}"
+
+
+- hosts: localhost
+  tasks:
+    - name: Add each EC2 instance to the ELB
+      ec2_elb:
+        state: present
+        ec2_elbs: "my-load-balancer"
+        region: "{{ item.region }}"
+        instance_id: "{{ item.id }}"
+      with_items: "{{ ec2_instances.tagged_instances }}"
+	  
+    - action:
+       module: ec2_elb_info
+       names: my-load-balancer
+	  register: elb_info
+
+    - name: Curl Loadbalancer URL
+      uri:
+       url: {{ elb_info.dns_name }}
